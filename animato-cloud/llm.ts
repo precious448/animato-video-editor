@@ -274,6 +274,23 @@ export const OWN_FREE: Record<string, FreeSupport> = {
   xai: 'none', openai: 'none', anthropic: 'none', deepseek: 'none', fireworks: 'none',
 };
 
+/**
+ * How strong a FREE model is likely to be for coding / chat, from what its id and context size say (a heuristic: providers publish no quality score).
+ * Bigger parameter counts, known strong families, coder variants and long context rank up; tiny / mini / lite variants rank down.
+ */
+export function freeStrength(id: string, ctx = 0): number {
+  const s = String(id).toLowerCase();
+  const sizes = [...s.matchAll(/(\d+(?:\.\d+)?)b(?![a-z])/g)].map((m) => parseFloat(m[1])).filter((n) => n > 0 && n < 5000);
+  let n = Math.min(sizes.length ? Math.max(...sizes) : 0, 500) / 5;                       // up to 100 for 500B
+  if (/gpt-oss-120b|qwen3-coder|qwen3-next|qwen3-235|qwen3\.[5-9]|deepseek-(r1|v3|v4)|kimi-k[2-9]|glm-(4\.[5-9]|[5-9])|minimax-m|llama-3\.3-70b|llama-4|mistral-(large|medium)|devstral|nemotron|gemini-(2\.5|3|4)|gemma-[34]-(27|31)/.test(s)) n += 40;
+  if (/coder|devstral|code/.test(s)) n += 12;
+  if (/thinking|reason|r1/.test(s)) n += 6;
+  n += Math.min(ctx, 262144) / 8192;                                                         // up to 32 for 256K context
+  if (/(^|[-/:_.])(mini|small|nano|lite|tiny|1b|3b|4b|1\.5b)(?![a-z0-9])/.test(s)) n -= 25;
+  if (/vision|-vl\b|ocr|embed|audio|image/.test(s)) n -= 10;
+  return n;
+}
+
 /** The models a person can choose from for one of their keys: the free ones or every one (paid). */
 export async function listOwnModelsFor(provider: string, key: string, f: typeof fetch, tier: 'free' | 'paid'): Promise<{ models: { id: string; vision: boolean }[]; note?: string }> {
   const info = OWN_PROVIDERS[provider];
@@ -300,7 +317,10 @@ export async function listOwnModelsFor(provider: string, key: string, f: typeof 
       }
       const ranked = all.filter((m) => free.has(m.id));
       const extra = [...free].filter((id) => !ranked.some((m) => m.id === id) && (provider !== 'openrouter' || rows.find((m) => m.id === id && Number(m.context_length || 0) >= 16000))).map((id) => ({ id, vision: ownVision(provider, id) }));
-      return { models: cap([...ranked, ...extra]) };
+      // Best performing first: the first free model is what the app and the Coding Agent use unless the person picks another.
+      const ctxOf = new Map<string, number>(rows.map((m: any) => [String(m?.id || ''), Number(m?.context_length || 0)]));
+      const merged = [...ranked, ...extra].sort((a, b) => freeStrength(b.id, ctxOf.get(b.id) || 0) - freeStrength(a.id, ctxOf.get(a.id) || 0));
+      return { models: cap(merged) };
     } catch { return { models: [], note: `Could not reach ${info.label}. Try again in a moment.` }; }
   }
   // probe / all: these providers do not label free models, so the researched list (FREE_HINTS) plus every
@@ -452,6 +472,14 @@ export class LlmPool {
       return chosen;
     }
     if (s.own) {
+      // No models chosen in the settings: FREE models by default (best first) wherever the provider has a free tier. Never spends the person's money unasked on OpenRouter / Together.
+      const sup = OWN_FREE[s.provider] || 'none';
+      if (sup !== 'none') {
+        const fr = (await listOwnModelsFor(s.provider, s.key, this.f, 'free').catch(() => ({ models: [] as ModelInfo[] }))).models;
+        let freeOwn = fr.filter((m) => modelReady(ownNs(s), m.id));
+        if (req.images?.length) freeOwn = freeOwn.filter((m) => m.vision);
+        if (freeOwn.length || sup === 'flag') return freeOwn.slice(0, 3);
+      }
       let own = await discoverOwn(s.provider, s.key, this.f);
       if (!own.length) own = (OWN_DEFAULTS[s.provider] || []).map((id) => ({ id, vision: ownVision(s.provider, id) }));
       own = own.filter((m) => modelReady(ownNs(s), m.id));
